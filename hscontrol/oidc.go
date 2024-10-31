@@ -89,7 +89,7 @@ func NewAuthProviderOIDC(
 		registerCacheCleanup,
 	)
 
-	return &AuthProviderOIDC{
+	ap := &AuthProviderOIDC{
 		serverURL:         serverURL,
 		cfg:               cfg,
 		db:                db,
@@ -99,7 +99,9 @@ func NewAuthProviderOIDC(
 
 		oidcProvider: oidcProvider,
 		oauth2Config: oauth2Config,
-	}, nil
+	}
+
+	return ap, nil
 }
 
 func (a *AuthProviderOIDC) AuthURL(mKey key.MachinePublic) string {
@@ -199,12 +201,19 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	idToken, err := a.extractIDToken(req.Context(), code)
+	idToken, refreshToken, err := a.exchangeTokens(req.Context(), code)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 	nodeExpiry := a.determineNodeExpiry(idToken.Expiry)
+
+	// Retrieve the node and the machine key from the state cache and
+	// database.
+	// If the node exists, then the node should be reauthenticated,
+	// if the node does not exist, and the machine key exists, then
+	// this is a new node that should be registered.
+	node, mKey := a.getMachineKeyFromState(state)
 
 	var claims types.OIDCClaims
 	if err := idToken.Claims(&claims); err != nil {
@@ -233,19 +242,18 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 		return
 	}
 
-	// Retrieve the node and the machine key from the state cache and
-	// database.
-	// If the node exists, then the node should be reauthenticated,
-	// if the node does not exist, and the machine key exists, then
-	// this is a new node that should be registered.
-	node, mKey := a.getMachineKeyFromState(state)
-
 	// Reauthenticate the node if it does exists.
 	if node != nil {
 		err := a.reauthenticateNode(node, nodeExpiry)
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		if refreshToken != "" {
+			if err := a.saveRefreshToken(node.ID, refreshToken); err != nil {
+				util.LogErr(err, "Failed to save refresh token")
+			}
 		}
 
 		// TODO(kradalby): replace with go-elem
@@ -270,9 +278,16 @@ func (a *AuthProviderOIDC) OIDCCallbackHandler(
 
 	// Register the node if it does not exist.
 	if mKey != nil {
-		if err := a.registerNode(user, mKey, nodeExpiry); err != nil {
+		node, err = a.registerNode(user, mKey, nodeExpiry)
+		if err != nil {
 			http.Error(writer, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		if refreshToken != "" {
+			if err := a.saveRefreshToken(node.ID, refreshToken); err != nil {
+				util.LogErr(err, "Failed to save refresh token")
+			}
 		}
 
 		content, err := renderOIDCCallbackTemplate(user)
@@ -309,18 +324,27 @@ func extractCodeAndStateParamFromRequest(
 	return code, state, nil
 }
 
-// extractIDToken takes the code parameter from the callback
-// and extracts the ID token from the oauth2 token.
-func (a *AuthProviderOIDC) extractIDToken(
+// exchangeTokens takes the code parameter from the callback
+// and extracts ID and refresh tokens from the oauth2 token.
+func (a *AuthProviderOIDC) exchangeTokens(
 	ctx context.Context,
 	code string,
-) (*oidc.IDToken, error) {
+) (idToken *oidc.IDToken, refreshToken string, err error) {
 	oauth2Token, err := a.oauth2Config.Exchange(ctx, code)
 	if err != nil {
-		return nil, fmt.Errorf("could not exchange code for token: %w", err)
+		return nil, "", fmt.Errorf("could not exchange code for token: %w", err)
 	}
 
-	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+	idToken, err = a.extractIDToken(ctx, oauth2Token)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return idToken, oauth2Token.RefreshToken, nil
+}
+
+func (a *AuthProviderOIDC) extractIDToken(ctx context.Context, t *oauth2.Token) (*oidc.IDToken, error) {
+	rawIDToken, ok := t.Extra("id_token").(string)
 	if !ok {
 		return nil, errNoOIDCIDToken
 	}
@@ -431,6 +455,16 @@ func (a *AuthProviderOIDC) reauthenticateNode(
 	return nil
 }
 
+func (a *AuthProviderOIDC) saveRefreshToken(nodeID types.NodeID, token string) error {
+	rt := &types.RefreshToken{
+		Token:  token,
+		NodeID: nodeID,
+	}
+
+	_, err := a.db.SaveRefreshToken(rt)
+	return err
+}
+
 func (a *AuthProviderOIDC) createOrUpdateUserFromClaim(
 	claims *types.OIDCClaims,
 ) (*types.User, error) {
@@ -468,23 +502,24 @@ func (a *AuthProviderOIDC) registerNode(
 	user *types.User,
 	machineKey *key.MachinePublic,
 	expiry time.Time,
-) error {
+) (*types.Node, error) {
 	ipv4, ipv6, err := a.ipAlloc.Next()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if _, err := a.db.RegisterNodeFromAuthCallback(
+	node, err := a.db.RegisterNodeFromAuthCallback(
 		*machineKey,
 		types.UserID(user.ID),
 		&expiry,
 		util.RegisterMethodOIDC,
 		ipv4, ipv6,
-	); err != nil {
-		return fmt.Errorf("could not register node: %w", err)
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not register node: %w", err)
 	}
 
-	return nil
+	return node, nil
 }
 
 // TODO(kradalby):
@@ -501,4 +536,108 @@ func renderOIDCCallbackTemplate(
 	}
 
 	return &content, nil
+}
+
+// refreshIfPossible checks if the node was authenticated via oidc and tries to refresh its token.
+// If token was refreshed successfully, the node is represented in returned slice.
+// It's possible that len(refreshed) > 0 && err != nil.
+func (a *AuthProviderOIDC) refreshIfPossible(
+	ctx context.Context,
+	nodes []types.NodeID,
+) (refreshed []types.NodeID, err error) {
+	tokens, err := a.db.GetRefreshTokens(nodes...)
+	if err != nil {
+		return nil, fmt.Errorf("can't get refresh tokens: %w", err)
+	}
+
+	for n, t := range tokens {
+		expiry, err := a.refreshNode(ctx, t)
+		if err != nil {
+			log.Err(err).Uint64("node_id", uint64(n)).Msg("failed to refresh node")
+			continue
+		}
+
+		if err := a.db.NodeSetExpiry(n, expiry); err != nil {
+			log.Error().Err(err).Msg("failed to set node expiry")
+			continue
+		}
+
+		refreshed = append(refreshed, n)
+	}
+
+	return refreshed, nil
+}
+
+func (a *AuthProviderOIDC) refreshJob(ctx context.Context) {
+	rp := a.cfg.ForceRefreshPeriod
+	if rp == 0 {
+		return
+	}
+
+	ticker := time.NewTicker(rp)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			tokens, err := a.db.GetRefreshTokens()
+			if err != nil {
+				log.Error().Err(err).Msg("failed to get refresh tokens")
+				continue
+			}
+
+			for n, t := range tokens {
+				expiry, err := a.refreshNode(ctx, t)
+				if err != nil {
+					log.Err(err).Uint64("node_id", uint64(n)).Msg("failed to refresh node")
+				}
+
+				if err := a.db.NodeSetExpiry(n, expiry); err != nil {
+					log.Error().Err(err).Msg("failed to set node expiry")
+				}
+			}
+		}
+	}
+}
+
+// refreshNode tries to refresh ID token using given refresh token and determine node expiry.
+// If we couldn't refresh ID token, expiry is set to zero, which means that the session is over.
+func (a *AuthProviderOIDC) refreshNode(ctx context.Context, rt *types.RefreshToken) (newExpiry time.Time, err error) {
+	newExpiry = time.Now()
+
+	idToken, refreshToken, err := a.refreshToken(ctx, rt)
+	if err != nil {
+		return newExpiry, fmt.Errorf("can't refresh token: %w", err)
+	}
+
+	newExpiry = a.determineNodeExpiry(idToken.Expiry)
+
+	if refreshToken == rt.Token {
+		return
+	}
+
+	rt.Token = refreshToken
+	if _, err := a.db.SaveRefreshToken(rt); err != nil {
+		// still return determined expiry, because we were able to refresh session
+		return newExpiry, fmt.Errorf("can't update refresh token: %w", err)
+	}
+
+	return
+}
+
+func (a *AuthProviderOIDC) refreshToken(ctx context.Context, rt *types.RefreshToken) (*oidc.IDToken, string, error) {
+	ts := a.oauth2Config.TokenSource(ctx, &oauth2.Token{RefreshToken: rt.Token})
+	refreshed, err := ts.Token()
+	if err != nil {
+		return nil, "", fmt.Errorf("could not get token from source: %w", err)
+	}
+
+	idToken, err := a.extractIDToken(ctx, refreshed)
+	if err != nil {
+		return nil, "", fmt.Errorf("could not extract id token: %w", err)
+	}
+
+	return idToken, refreshed.RefreshToken, nil
 }
